@@ -174,7 +174,8 @@ def calculate_positions(tasks):
         start_date = datetime.fromisoformat(t.start)
 
         days = (start_date - base_date).days
-        x = LEFT_OFFSET + days * 150
+        GAP = 50
+        x = LEFT_OFFSET + days * 150 + GAP
 
         users = extract_users(tasks)
 
