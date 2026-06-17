@@ -12,7 +12,7 @@ OPENPROJECT_HTTPS=false
 # Please use a pseudo-random value for this and treat it like a password.
 # If you are on Linux you can generate a scret key with the following command
 # head /dev/urandom | tr -dc A-Za-z0-9 | head -c 32 ; echo ''
-SECRET_KEY_BASE=KEY_PROJECT_AGIL
+SECRET_KEY_BASE=OVERWRITE_ME
 OPENPROJECT_HOST__NAME=localhost
 PORT=127.0.0.1:8080
 OPENPROJECT_RAILS__RELATIVE__URL__ROOT=
