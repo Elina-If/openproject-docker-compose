@@ -1,5 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime
+from datetime import timedelta
 
 # FastAPI-Anwendung erstellen
 app = FastAPI()
@@ -70,10 +72,12 @@ def get_relations(task_id):
     return response.json()
 
 class Task:
-    def __init__(self, id, name, assignee):
+    def __init__(self, id, name, assignee, start, end):
         self.id = id
         self.name = name
         self.assignee = assignee
+        self.start = start
+        self.end = end
         self.predecessors = []
         self.successors = []
 
@@ -85,11 +89,14 @@ def parse_tasks(data):
             id=wp["id"],
             name=wp["subject"],
             assignee=wp["_links"]["assignee"]["title"]
-                if wp["_links"]["assignee"] else None
+                if wp["_links"]["assignee"] else None,
+            start=wp.get("startDate"),
+            end=wp.get("dueDate")
         )
         tasks[task.id] = task
 
     return tasks
+
 
 def build_relations(tasks):
     for task_id in tasks:
@@ -123,6 +130,101 @@ def to_network_json(tasks):
 
     return {"nodes": nodes, "edges": edges}
 
+def extract_users(tasks):
+    users = set()
+
+    for t in tasks.values():
+        if t.assignee:
+            users.add(t.assignee)
+
+    return list(users)
+
+
+def calculate_positions(tasks):
+    base_date = None
+    max_date = None
+    LEFT_OFFSET = 200
+
+    # frühestes Datum bestimmen
+    for t in tasks.values():
+        if t.start:
+            d = datetime.fromisoformat(t.start)
+
+            if base_date is None or d < base_date:
+                base_date = d
+
+            if max_date is None or d > max_date:
+                max_date = d
+
+    nodes = []
+    edges = []
+
+    for t in tasks.values():
+        # ❗ Sicherheitscheck
+
+        if base_date is None:
+            continue
+
+        if not t.start:
+            days = 0
+        else:
+            start_date = datetime.fromisoformat(t.start)
+            days = (start_date - base_date).days
+
+        start_date = datetime.fromisoformat(t.start)
+
+        days = (start_date - base_date).days
+        x = LEFT_OFFSET + days * 150
+
+        users = extract_users(tasks)
+
+        # Reihenfolge festlegen
+        user_positions = {}
+        for i, user in enumerate(users):
+            user_positions[user] = 100 + i * 200
+            y = user_positions.get(t.assignee, 500)
+
+
+        # Dauer berechnen
+        if t.start and t.end:
+            start = datetime.fromisoformat(t.start)
+            end = datetime.fromisoformat(t.end)
+            duration = (end - start).days + 1
+        else:
+            duration = 1
+
+        nodes.append({
+            "id": str(t.id),
+            "label": t.name,
+            "position": {"x": x, "y": y},
+            "width": duration * 150   # 🔥 Breite = Dauer
+        })
+
+
+        for succ in t.successors:
+            edges.append({
+                "id": f"{t.id}-{succ.id}",
+                "source": str(t.id),
+                "target": str(succ.id)
+            })
+
+    # ✅ Timeline sicher berechnen
+    timeline = []
+    if base_date and max_date:
+        current = base_date
+        while current <= max_date:
+            timeline.append(current.strftime("%d.%m"))
+            current = current + timedelta(days=1)
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "timeline": timeline,
+        "users": users 
+    }
+
+
+
 def fetch_tasks_from_openproject():
     url = "http://localhost:8080/api/v3/work_packages"
 
@@ -145,4 +247,4 @@ def get_network():
     tasks = parse_tasks(data)
     build_relations(tasks)
 
-    return to_network_json(tasks)
+    return calculate_positions(tasks)
