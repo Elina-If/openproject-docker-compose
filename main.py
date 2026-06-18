@@ -299,36 +299,16 @@ def build_network_payload(project_id: int) -> dict[str, Any]:
 
 	nodes: list[dict[str, Any]] = []
 	node_map: dict[int, dict[str, Any]] = {}
-	occupied_slots_by_level: dict[int, set[int]] = {}
-
-	def nearest_free_slot(level: int, preferred_slot: int) -> int:
-		occupied = occupied_slots_by_level.setdefault(level, set())
-		if preferred_slot < 0:
-			preferred_slot = 0
-
-		if preferred_slot not in occupied:
-			occupied.add(preferred_slot)
-			return preferred_slot
-
-		distance = 1
-		while True:
-			down_candidate = preferred_slot + distance
-			if down_candidate not in occupied:
-				occupied.add(down_candidate)
-				return down_candidate
-
-			up_candidate = preferred_slot - distance
-			if up_candidate >= 0 and up_candidate not in occupied:
-				occupied.add(up_candidate)
-				return up_candidate
-
-			distance += 1
 
 	for level in sorted(level_to_tasks.keys()):
 		task_ids = level_to_tasks[level]
 
 		if level == 0:
 			ordered_task_ids = task_ids
+			preferred_y_by_task = {
+				task_id: TOP_OFFSET + index * ROW_HEIGHT
+				for index, task_id in enumerate(ordered_task_ids)
+			}
 		else:
 			def preferred_y(task_id: int) -> float:
 				preds = sorted(predecessors.get(task_id, set()))
@@ -338,34 +318,27 @@ def build_network_payload(project_id: int) -> dict[str, Any]:
 					if pred_id in node_map
 				]
 				if pred_centers:
-					return sum(pred_centers) / len(pred_centers)
-				return TOP_OFFSET + NODE_HEIGHT / 2
+					return (sum(pred_centers) / len(pred_centers)) - NODE_HEIGHT / 2
+				return TOP_OFFSET
 
-			ordered_task_ids = sorted(task_ids, key=lambda task_id: (preferred_y(task_id), task_id))
+			preferred_y_by_task = {task_id: preferred_y(task_id) for task_id in task_ids}
+			ordered_task_ids = sorted(task_ids, key=lambda task_id: (preferred_y_by_task[task_id], task_id))
 
-		for row_index, task_id in enumerate(ordered_task_ids):
+		placed_y: list[float] = []
+		for task_id in ordered_task_ids:
 			task = task_by_id[task_id]
 			duration = int(task["durationDays"])
 			width = max(110, DAY_WIDTH * duration - 10)
 			x = LEFT_OFFSET + level * STEP_X_GAP
+			preferred_top = max(TOP_OFFSET, preferred_y_by_task.get(task_id, TOP_OFFSET))
 
-			if level == 0:
-				preferred_slot = row_index
-			else:
-				preds = sorted(predecessors.get(task_id, set()))
-				pred_centers = [
-					node_map[pred_id]["y"] + NODE_HEIGHT / 2
-					for pred_id in preds
-					if pred_id in node_map
-				]
-				if pred_centers:
-					preferred_top = (sum(pred_centers) / len(pred_centers)) - NODE_HEIGHT / 2
-					preferred_slot = round((preferred_top - TOP_OFFSET) / ROW_HEIGHT)
-				else:
-					preferred_slot = row_index
+			# In derselben Spalte werden Knoten nur so weit verschoben, wie es fuer Nicht-Ueberlappung noetig ist.
+			y = preferred_top
+			if placed_y:
+				min_y = placed_y[-1] + ROW_HEIGHT
+				y = max(y, min_y)
 
-			slot = nearest_free_slot(level, preferred_slot)
-			y = TOP_OFFSET + slot * ROW_HEIGHT
+			placed_y.append(y)
 
 			node = {
 				"id": str(task_id),
@@ -375,7 +348,7 @@ def build_network_payload(project_id: int) -> dict[str, Any]:
 				"dueDate": task["dueDate"],
 				"durationDays": duration,
 				"x": x,
-				"y": y,
+				"y": int(y),
 				"width": width,
 				"height": NODE_HEIGHT,
 			}
