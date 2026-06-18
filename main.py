@@ -18,11 +18,12 @@ OPENPROJECT_USERNAME = os.getenv("OPENPROJECT_USERNAME", "")
 OPENPROJECT_PASSWORD = os.getenv("OPENPROJECT_PASSWORD", "")
 TARGET_PROJECT_ID = 3
 LEFT_OFFSET = 220
-TOP_OFFSET = 64
-ROW_HEIGHT = 96
+TOP_OFFSET = 80
+ROW_HEIGHT = 92
 DAY_WIDTH = 86
 NODE_HEIGHT = 62
 ROW_TASK_GAP = 28
+STEP_X_GAP = 260
 
 
 app = FastAPI(title="OpenProject Bridge API")
@@ -148,6 +149,33 @@ def task_duration_days(duration_raw: str | None, start_date: str | None, due_dat
 	return 1
 
 
+def relation_to_dependency_edge(relation: dict[str, Any]) -> tuple[int, int] | None:
+	from_href = relation.get("_links", {}).get("from", {}).get("href", "")
+	to_href = relation.get("_links", {}).get("to", {}).get("href", "")
+	if not from_href or not to_href:
+		return None
+
+	try:
+		from_id = int(from_href.rstrip("/").split("/")[-1])
+		to_id = int(to_href.rstrip("/").split("/")[-1])
+	except ValueError:
+		return None
+
+	relation_type = str(relation.get("type") or "").lower()
+
+	# OpenProject-Semantik:
+	# - precedes: from -> to
+	# - follows:  from folgt to, also to -> from
+	if relation_type == "follows":
+		return (to_id, from_id)
+
+	if relation_type in {"precedes", ""}:
+		return (from_id, to_id)
+
+	# Nicht-ablaufrelevante Beziehungen (z. B. relates) werden ignoriert.
+	return None
+
+
 def order_row_tasks_right_to_left(
 	row_task_ids: list[int],
 	task_by_id: dict[int, dict[str, Any]],
@@ -213,7 +241,6 @@ def build_network_payload(project_id: int) -> dict[str, Any]:
 		)
 
 	resources = sorted({task["assignee"] for task in tasks}) or ["Unassigned"]
-	resource_index = {name: idx for idx, name in enumerate(resources)}
 	task_by_id = {int(task["id"]): task for task in tasks}
 	known_ids = set(task_by_id.keys())
 
@@ -225,16 +252,11 @@ def build_network_payload(project_id: int) -> dict[str, Any]:
 		task_id = int(task["id"])
 		relations = fetch_work_package_relations(task_id)
 		for relation in relations:
-			from_href = relation.get("_links", {}).get("from", {}).get("href", "")
-			to_href = relation.get("_links", {}).get("to", {}).get("href", "")
-			if not from_href or not to_href:
+			edge = relation_to_dependency_edge(relation)
+			if edge is None:
 				continue
 
-			try:
-				source_id = int(from_href.rstrip("/").split("/")[-1])
-				target_id = int(to_href.rstrip("/").split("/")[-1])
-			except ValueError:
-				continue
+			source_id, target_id = edge
 
 			if source_id not in known_ids or target_id not in known_ids:
 				continue
@@ -243,82 +265,224 @@ def build_network_payload(project_id: int) -> dict[str, Any]:
 			successors[source_id].add(target_id)
 			predecessors[target_id].add(source_id)
 
-	starts = [parse_iso_date(task["startDate"]) for task in tasks if parse_iso_date(task["startDate"]) is not None]
-	ends = [parse_iso_date(task["dueDate"]) for task in tasks if parse_iso_date(task["dueDate"]) is not None]
+	# Netzplanstufen: Startpunkt -> Pakete ohne Vorgaenger -> Folgepakete nach Abhaengigkeitstiefe
+	queue = sorted([task_id for task_id in known_ids if len(predecessors[task_id]) == 0])
+	in_degree = {task_id: len(predecessors[task_id]) for task_id in known_ids}
+	topo_order: list[int] = []
 
-	base_date = min(starts) if starts else None
-	last_date = max([d for d in ends if d is not None], default=base_date)
+	while queue:
+		current = queue.pop(0)
+		topo_order.append(current)
+		for successor in sorted(successors.get(current, set())):
+			in_degree[successor] -= 1
+			if in_degree[successor] == 0:
+				queue.append(successor)
+		queue.sort()
 
-	timeline: list[str] = []
-	if base_date and last_date:
-		cursor = base_date
-		while cursor <= last_date:
-			timeline.append(cursor.isoformat())
-			cursor += timedelta(days=1)
+	if len(topo_order) < len(known_ids):
+		remaining = sorted([task_id for task_id in known_ids if task_id not in set(topo_order)])
+		topo_order.extend(remaining)
 
-	required_columns = max(len(timeline), 1)
-	for resource in resources:
-		row_tasks = [task for task in tasks if task["assignee"] == resource]
-		if not row_tasks:
-			continue
+	levels: dict[int, int] = {task_id: 0 for task_id in known_ids}
+	for task_id in topo_order:
+		for successor in successors.get(task_id, set()):
+			levels[successor] = max(levels[successor], levels[task_id] + 1)
 
-		row_pixel_width = 0
-		for index, row_task in enumerate(row_tasks):
-			row_pixel_width += max(100, DAY_WIDTH * int(row_task["durationDays"]) - 10)
-			if index < len(row_tasks) - 1:
-				row_pixel_width += ROW_TASK_GAP
+	level_to_tasks: dict[int, list[int]] = {}
+	for task_id in known_ids:
+		level_to_tasks.setdefault(levels[task_id], []).append(task_id)
 
-		required_columns = max(required_columns, ceil(row_pixel_width / DAY_WIDTH) + 1)
+	for level in level_to_tasks:
+		level_to_tasks[level].sort()
 
-	row_right_anchor = LEFT_OFFSET + required_columns * DAY_WIDTH - 20
+	roots = sorted([task_id for task_id in known_ids if len(predecessors[task_id]) == 0])
 
 	nodes: list[dict[str, Any]] = []
 	node_map: dict[int, dict[str, Any]] = {}
-	for resource in resources:
-		row_index = resource_index.get(resource, 0)
-		row_y = TOP_OFFSET + row_index * ROW_HEIGHT
-		row_task_ids = [int(task["id"]) for task in tasks if task["assignee"] == resource]
-		ordered_ids = order_row_tasks_right_to_left(row_task_ids, task_by_id, predecessors)
+	occupied_slots_by_level: dict[int, set[int]] = {}
 
-		cursor_right = row_right_anchor
-		for task_id in ordered_ids:
+	def nearest_free_slot(level: int, preferred_slot: int) -> int:
+		occupied = occupied_slots_by_level.setdefault(level, set())
+		if preferred_slot < 0:
+			preferred_slot = 0
+
+		if preferred_slot not in occupied:
+			occupied.add(preferred_slot)
+			return preferred_slot
+
+		distance = 1
+		while True:
+			down_candidate = preferred_slot + distance
+			if down_candidate not in occupied:
+				occupied.add(down_candidate)
+				return down_candidate
+
+			up_candidate = preferred_slot - distance
+			if up_candidate >= 0 and up_candidate not in occupied:
+				occupied.add(up_candidate)
+				return up_candidate
+
+			distance += 1
+
+	for level in sorted(level_to_tasks.keys()):
+		task_ids = level_to_tasks[level]
+
+		if level == 0:
+			ordered_task_ids = task_ids
+		else:
+			def preferred_y(task_id: int) -> float:
+				preds = sorted(predecessors.get(task_id, set()))
+				pred_centers = [
+					node_map[pred_id]["y"] + NODE_HEIGHT / 2
+					for pred_id in preds
+					if pred_id in node_map
+				]
+				if pred_centers:
+					return sum(pred_centers) / len(pred_centers)
+				return TOP_OFFSET + NODE_HEIGHT / 2
+
+			ordered_task_ids = sorted(task_ids, key=lambda task_id: (preferred_y(task_id), task_id))
+
+		for row_index, task_id in enumerate(ordered_task_ids):
 			task = task_by_id[task_id]
 			duration = int(task["durationDays"])
-			width = max(100, DAY_WIDTH * duration - 10)
+			width = max(110, DAY_WIDTH * duration - 10)
+			x = LEFT_OFFSET + level * STEP_X_GAP
+
+			if level == 0:
+				preferred_slot = row_index
+			else:
+				preds = sorted(predecessors.get(task_id, set()))
+				pred_centers = [
+					node_map[pred_id]["y"] + NODE_HEIGHT / 2
+					for pred_id in preds
+					if pred_id in node_map
+				]
+				if pred_centers:
+					preferred_top = (sum(pred_centers) / len(pred_centers)) - NODE_HEIGHT / 2
+					preferred_slot = round((preferred_top - TOP_OFFSET) / ROW_HEIGHT)
+				else:
+					preferred_slot = row_index
+
+			slot = nearest_free_slot(level, preferred_slot)
+			y = TOP_OFFSET + slot * ROW_HEIGHT
+
 			node = {
-				"id": str(task["id"]),
+				"id": str(task_id),
 				"label": task["subject"],
 				"assignee": task["assignee"],
 				"startDate": task["startDate"],
 				"dueDate": task["dueDate"],
 				"durationDays": duration,
-				"x": cursor_right - width,
-				"y": row_y,
+				"x": x,
+				"y": y,
 				"width": width,
 				"height": NODE_HEIGHT,
 			}
 			nodes.append(node)
 			node_map[task_id] = node
-			cursor_right = node["x"] - ROW_TASK_GAP
+
+	start_y = TOP_OFFSET
+	if roots:
+		root_centers = [node_map[root_id]["y"] + NODE_HEIGHT / 2 for root_id in roots if root_id in node_map]
+		if root_centers:
+			start_y = int(sum(root_centers) / len(root_centers) - NODE_HEIGHT / 2)
+
+	start_node = {
+		"id": "START",
+		"label": "Startpunkt",
+		"assignee": "",
+		"startDate": None,
+		"dueDate": None,
+		"durationDays": 0,
+		"x": max(40, LEFT_OFFSET - 170),
+		"y": start_y,
+		"width": 120,
+		"height": NODE_HEIGHT,
+		"isStart": True,
+	}
+	nodes.append(start_node)
 
 	edges: list[dict[str, Any]] = []
 	for source_id, target_id in sorted(relation_pairs):
-			source_node = node_map.get(source_id)
-			target_node = node_map.get(target_id)
-			if not source_node or not target_node:
-				continue
+		source_node = node_map.get(source_id)
+		target_node = node_map.get(target_id)
+		if not source_node or not target_node:
+			continue
 
-			edges.append(
-				{
-					"id": f"{source_id}-{target_id}",
-					"source": str(source_id),
-					"target": str(target_id),
-					"x1": source_node["x"] + source_node["width"],
-					"y1": source_node["y"] + source_node["height"] / 2,
-					"x2": target_node["x"],
-					"y2": target_node["y"] + target_node["height"] / 2,
-				}
-			)
+		edges.append(
+			{
+				"id": f"{source_id}-{target_id}",
+				"source": str(source_id),
+				"target": str(target_id),
+				"x1": source_node["x"] + source_node["width"],
+				"y1": source_node["y"] + source_node["height"] / 2,
+				"x2": target_node["x"],
+				"y2": target_node["y"] + target_node["height"] / 2,
+			}
+		)
+
+	for root_id in roots:
+		target_node = node_map.get(root_id)
+		if not target_node:
+			continue
+		edges.append(
+			{
+				"id": f"START-{root_id}",
+				"source": "START",
+				"target": str(root_id),
+				"x1": start_node["x"] + start_node["width"],
+				"y1": start_node["y"] + start_node["height"] / 2,
+				"x2": target_node["x"],
+				"y2": target_node["y"] + target_node["height"] / 2,
+			}
+		)
+
+	max_level = max(level_to_tasks.keys(), default=0)
+
+	sinks = sorted([task_id for task_id in known_ids if len(successors.get(task_id, set())) == 0])
+	end_y = TOP_OFFSET
+	if sinks:
+		sink_centers = [node_map[sink_id]["y"] + NODE_HEIGHT / 2 for sink_id in sinks if sink_id in node_map]
+		if sink_centers:
+			end_y = int(sum(sink_centers) / len(sink_centers) - NODE_HEIGHT / 2)
+
+	rightmost_sink_right = max(
+		[node_map[sink_id]["x"] + node_map[sink_id]["width"] for sink_id in sinks if sink_id in node_map],
+		default=LEFT_OFFSET + max_level * STEP_X_GAP,
+	)
+	end_node_x = rightmost_sink_right + 140
+	end_node = {
+		"id": "END",
+		"label": "Endpunkt",
+		"assignee": "",
+		"startDate": None,
+		"dueDate": None,
+		"durationDays": 0,
+		"x": end_node_x,
+		"y": end_y,
+		"width": 120,
+		"height": NODE_HEIGHT,
+		"isEnd": True,
+	}
+	nodes.append(end_node)
+
+	for sink_id in sinks:
+		source_node = node_map.get(sink_id)
+		if not source_node:
+			continue
+		edges.append(
+			{
+				"id": f"{sink_id}-END",
+				"source": str(sink_id),
+				"target": "END",
+				"x1": source_node["x"] + source_node["width"],
+				"y1": source_node["y"] + source_node["height"] / 2,
+				"x2": end_node["x"],
+				"y2": end_node["y"] + end_node["height"] / 2,
+			}
+		)
+	timeline = [f"Schritt {step + 1}" for step in range(max_level + 1)]
 
 	return {
 		"projectId": project_id,
@@ -328,10 +492,10 @@ def build_network_payload(project_id: int) -> dict[str, Any]:
 			"leftOffset": LEFT_OFFSET,
 			"topOffset": TOP_OFFSET,
 			"rowHeight": ROW_HEIGHT,
-			"dayWidth": DAY_WIDTH,
+			"dayWidth": STEP_X_GAP,
 			"nodeHeight": NODE_HEIGHT,
 			"rowTaskGap": ROW_TASK_GAP,
-			"rowRightAnchor": row_right_anchor,
+			"rowRightAnchor": LEFT_OFFSET + max_level * STEP_X_GAP,
 		},
 		"nodes": nodes,
 		"edges": edges,
