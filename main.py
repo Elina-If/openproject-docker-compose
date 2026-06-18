@@ -88,6 +88,24 @@ def fetch_project_work_packages(project_id: int) -> list[dict[str, Any]]:
 	return payload.get("_embedded", {}).get("elements", [])
 
 
+def fetch_project_memberships(project_id: int) -> list[dict[str, Any]]:
+	# Manche OpenProject-Versionen bieten keinen projektspezifischen Membership-Endpoint.
+	# Daher zuerst direkter Pfad, bei Fehler Fallback auf globale Membership-Suche mit Filter.
+	try:
+		payload = openproject_get(f"projects/{project_id}/memberships", params={"pageSize": "200"})
+		return payload.get("_embedded", {}).get("elements", [])
+	except HTTPException as exc:
+		if exc.status_code != 502 or "404" not in str(exc.detail):
+			raise
+
+	filters = {
+		"filters": f'[{{"project":{{"operator":"=","values":["{project_id}"]}}}}]',
+		"pageSize": "200",
+	}
+	payload = openproject_get("memberships", params=filters)
+	return payload.get("_embedded", {}).get("elements", [])
+
+
 def fetch_work_package_relations(work_package_id: int) -> list[dict[str, Any]]:
 	payload = openproject_get(f"work_packages/{work_package_id}/relations")
 	return payload.get("_embedded", {}).get("elements", [])
@@ -356,6 +374,7 @@ def get_project_3_work_packages() -> list[dict[str, Any]]:
 			{
 				"id": item.get("id"),
 				"subject": item.get("subject"),
+				"description": rich_text_to_string(item.get("description")),
 				"assignee": assignee,
 				"startDate": start_date,
 				"dueDate": effective_end,
@@ -365,6 +384,34 @@ def get_project_3_work_packages() -> list[dict[str, Any]]:
 		)
 
 	return sorted(result, key=lambda wp: wp.get("id") or 0)
+
+
+@app.get("/project/3/members")
+def get_project_3_members() -> list[dict[str, Any]]:
+	memberships = fetch_project_memberships(TARGET_PROJECT_ID)
+	unique_members: dict[str, dict[str, Any]] = {}
+
+	for membership in memberships:
+		principal = membership.get("_links", {}).get("principal", {})
+		if not isinstance(principal, dict):
+			continue
+
+		name = principal.get("title")
+		href = principal.get("href", "")
+		if not name or not href:
+			continue
+
+		member_id = href.rstrip("/").split("/")[-1]
+		if not member_id:
+			continue
+
+		unique_members[member_id] = {
+			"id": str(member_id),
+			"name": str(name),
+			"principalType": str(principal.get("type") or "Principal"),
+		}
+
+	return sorted(unique_members.values(), key=lambda member: member["name"].lower())
 
 
 @app.get("/project/3/network")
