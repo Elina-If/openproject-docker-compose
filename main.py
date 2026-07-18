@@ -1,42 +1,40 @@
 import os
 import re
 from datetime import date, datetime, timedelta
-from math import ceil
 from typing import Any
-
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-
 
 OPENPROJECT_BASE_URL = os.getenv("OPENPROJECT_BASE_URL", "http://localhost:8080/api/v3")
 OPENPROJECT_API_KEY = os.getenv(
 	"OPENPROJECT_API_KEY",
 	"opapi-99b19dcb0a1ad47170f7c50d2050a5b15d5fab000aa42fefbca7ad4d77040dd0",
 )
-OPENPROJECT_USERNAME = os.getenv("OPENPROJECT_USERNAME", "")
-OPENPROJECT_PASSWORD = os.getenv("OPENPROJECT_PASSWORD", "")
+
 TARGET_PROJECT_ID = 3
+
+#Layout constants for network diagram display
 LEFT_OFFSET = 220
 TOP_OFFSET = 80
 ROW_HEIGHT = 92
 DAY_WIDTH = 86
 NODE_HEIGHT = 62
 ROW_TASK_GAP = 28
-STEP_X_GAP = 260
+STEP_X_GAP = 260 #shifting network plan level to the right
 
 
-app = FastAPI(title="OpenProject Bridge API")
+app = FastAPI(title="OpenProject API")
 
 app.add_middleware(
 	CORSMiddleware,
-	allow_origins=["http://localhost:3000", "http://localhost:5173"],
+	allow_origins=["http://localhost:3000"],
 	allow_credentials=True,
 	allow_methods=["*"],
 	allow_headers=["*"],
 )
 
-
+#Convert rich text values into plain strings
 def rich_text_to_string(value: Any) -> str | None:
 	if isinstance(value, str):
 		return value
@@ -49,15 +47,13 @@ def rich_text_to_string(value: Any) -> str | None:
 			return html
 	return None
 
-
+#Encapsulate OpenProject API GET requests
 def openproject_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
 	url = f"{OPENPROJECT_BASE_URL.rstrip('/')}/{path.lstrip('/')}"
 	auth: tuple[str, str] | None = None
 
 	if OPENPROJECT_API_KEY:
 		auth = ("apikey", OPENPROJECT_API_KEY)
-	elif OPENPROJECT_USERNAME and OPENPROJECT_PASSWORD:
-		auth = (OPENPROJECT_USERNAME, OPENPROJECT_PASSWORD)
 
 	try:
 		response = requests.get(
@@ -71,7 +67,7 @@ def openproject_get(path: str, params: dict[str, Any] | None = None) -> dict[str
 			raise HTTPException(
 				status_code=401,
 				detail=(
-					"OpenProject Auth fehlgeschlagen. Setze OPENPROJECT_API_KEY oder OPENPROJECT_USERNAME/OPENPROJECT_PASSWORD."
+					"OpenProject Auth fehlgeschlagen. Setze OPENPROJECT_API_KEY."
 				),
 			)
 
@@ -80,7 +76,7 @@ def openproject_get(path: str, params: dict[str, Any] | None = None) -> dict[str
 	except requests.RequestException as exc:
 		raise HTTPException(status_code=502, detail=f"OpenProject API Fehler: {exc}") from exc
 
-
+#UC1, UC2, UC3: Fetch and return work packages
 def fetch_project_work_packages(project_id: int) -> list[dict[str, Any]]:
 	filters = {
 		"filters": f'[{{"project":{{"operator":"=","values":["{project_id}"]}}}}]'
@@ -88,10 +84,8 @@ def fetch_project_work_packages(project_id: int) -> list[dict[str, Any]]:
 	payload = openproject_get("work_packages", params=filters)
 	return payload.get("_embedded", {}).get("elements", [])
 
-
+#UC2, UC4: Fetch and return project memberships
 def fetch_project_memberships(project_id: int) -> list[dict[str, Any]]:
-	# Manche OpenProject-Versionen bieten keinen projektspezifischen Membership-Endpoint.
-	# Daher zuerst direkter Pfad, bei Fehler Fallback auf globale Membership-Suche mit Filter.
 	try:
 		payload = openproject_get(f"projects/{project_id}/memberships", params={"pageSize": "200"})
 		return payload.get("_embedded", {}).get("elements", [])
@@ -106,12 +100,12 @@ def fetch_project_memberships(project_id: int) -> list[dict[str, Any]]:
 	payload = openproject_get("memberships", params=filters)
 	return payload.get("_embedded", {}).get("elements", [])
 
-
+#UC1, UC3: Fetch and return work package relations
 def fetch_work_package_relations(work_package_id: int) -> list[dict[str, Any]]:
 	payload = openproject_get(f"work_packages/{work_package_id}/relations")
 	return payload.get("_embedded", {}).get("elements", [])
 
-
+#UC3, UC4: Parse string into python date
 def parse_iso_date(value: str | None) -> date | None:
 	if not value:
 		return None
@@ -120,12 +114,11 @@ def parse_iso_date(value: str | None) -> date | None:
 	except ValueError:
 		return None
 
-
+#UC3: Convert OpenProject duration values (ISO-) into working days
 def parse_openproject_duration_days(value: str | None) -> int | None:
 	if not value or not isinstance(value, str):
 		return None
 
-	# OpenProject liefert i. d. R. ISO-8601-Perioden wie P3D oder P2W.
 	match = re.fullmatch(r"P(?:(\d+)W)?(?:(\d+)D)?", value)
 	if not match:
 		return None
@@ -138,6 +131,7 @@ def parse_openproject_duration_days(value: str | None) -> int | None:
 
 
 def task_duration_days(duration_raw: str | None, start_date: str | None, due_date: str | None) -> int:
+	#UC3: Determine the effective task duration for schedule calculations.
 	duration_from_api = parse_openproject_duration_days(duration_raw)
 	if duration_from_api is not None:
 		return duration_from_api
@@ -148,7 +142,7 @@ def task_duration_days(duration_raw: str | None, start_date: str | None, due_dat
 		return (end - start).days + 1
 	return 1
 
-
+#UC1, UC3: Convert OpenProject relations into directed edges for network planning
 def relation_to_dependency_edge(relation: dict[str, Any]) -> tuple[int, int] | None:
 	from_href = relation.get("_links", {}).get("from", {}).get("href", "")
 	to_href = relation.get("_links", {}).get("to", {}).get("href", "")
@@ -163,64 +157,26 @@ def relation_to_dependency_edge(relation: dict[str, Any]) -> tuple[int, int] | N
 
 	relation_type = str(relation.get("type") or "").lower()
 
-	# OpenProject-Semantik:
-	# - precedes: from -> to
-	# - follows:  from folgt to, also to -> from
 	if relation_type == "follows":
 		return (to_id, from_id)
 
 	if relation_type in {"precedes", ""}:
 		return (from_id, to_id)
 
-	# Nicht-ablaufrelevante Beziehungen (z. B. relates) werden ignoriert.
 	return None
 
 
-def order_row_tasks_right_to_left(
-	row_task_ids: list[int],
-	task_by_id: dict[int, dict[str, Any]],
-	predecessors: dict[int, set[int]],
-) -> list[int]:
-	row_set = set(row_task_ids)
-	in_degree: dict[int, int] = {}
-	local_successors: dict[int, set[int]] = {task_id: set() for task_id in row_task_ids}
-
-	for task_id in row_task_ids:
-		local_preds = {pred for pred in predecessors.get(task_id, set()) if pred in row_set}
-		in_degree[task_id] = len(local_preds)
-		for pred in local_preds:
-			local_successors.setdefault(pred, set()).add(task_id)
-
-	def sort_key(task_id: int) -> tuple[date, int]:
-		start = parse_iso_date(task_by_id[task_id].get("startDate")) or date.min
-		return (start, task_id)
-
-	available = sorted([task_id for task_id in row_task_ids if in_degree[task_id] == 0], key=sort_key)
-	ordered: list[int] = []
-
-	while available:
-		current = available.pop(0)
-		ordered.append(current)
-
-		for successor in sorted(local_successors.get(current, set()), key=sort_key):
-			in_degree[successor] -= 1
-			if in_degree[successor] == 0:
-				available.append(successor)
-		available.sort(key=sort_key)
-
-	if len(ordered) == len(row_task_ids):
-		return ordered
-
-	remaining = [task_id for task_id in row_task_ids if task_id not in set(ordered)]
-	remaining.sort(key=sort_key)
-	return ordered + remaining
-
-
 def build_network_payload(project_id: int) -> dict[str, Any]:
+	#UC1: Build the network payload for structure visualization.
+	#UC3: Add scheduling data for path and timeline analysis.
+	#UC4: Add resource data for utilization visualization.
 	items = fetch_project_work_packages(project_id)
 
 	tasks: list[dict[str, Any]] = []
 	for item in items:
+		#UC1: Prepare reusable task data for the network nodes.
+		#UC3: Prepare reusable duration and date data for schedule analysis.
+		#UC4: Prepare reusable assignee data for utilization views.
 		assignee_link = item.get("_links", {}).get("assignee")
 		assignee = assignee_link.get("title") if isinstance(assignee_link, dict) else "Unassigned"
 		duration_raw = item.get("duration")
@@ -240,6 +196,8 @@ def build_network_payload(project_id: int) -> dict[str, Any]:
 			}
 		)
 
+	#UC2: Build the resource list for allocation interactions.
+	#UC4: Build the resource list for utilization views.
 	resources = sorted({task["assignee"] for task in tasks}) or ["Unassigned"]
 	task_by_id = {int(task["id"]): task for task in tasks}
 	known_ids = set(task_by_id.keys())
@@ -261,11 +219,13 @@ def build_network_payload(project_id: int) -> dict[str, Any]:
 			if source_id not in known_ids or target_id not in known_ids:
 				continue
 
+			#UC1: Convert relations into network edges.
+			#UC3: Convert relations into dependency edges for schedule logic.
 			relation_pairs.add((source_id, target_id))
 			successors[source_id].add(target_id)
 			predecessors[target_id].add(source_id)
 
-	# Netzplanstufen: Startpunkt -> Pakete ohne Vorgaenger -> Folgepakete nach Abhaengigkeitstiefe
+	#UC1: Derive network levels from predecessor depth.
 	queue = sorted([task_id for task_id in known_ids if len(predecessors[task_id]) == 0])
 	in_degree = {task_id: len(predecessors[task_id]) for task_id in known_ids}
 	topo_order: list[int] = []
@@ -304,6 +264,7 @@ def build_network_payload(project_id: int) -> dict[str, Any]:
 		task_ids = level_to_tasks[level]
 
 		if level == 0:
+			#UC1: Root tasks define the first network column.
 			ordered_task_ids = task_ids
 			preferred_y_by_task = {
 				task_id: TOP_OFFSET + index * ROW_HEIGHT
@@ -332,7 +293,7 @@ def build_network_payload(project_id: int) -> dict[str, Any]:
 			x = LEFT_OFFSET + level * STEP_X_GAP
 			preferred_top = max(TOP_OFFSET, preferred_y_by_task.get(task_id, TOP_OFFSET))
 
-			# In derselben Spalte werden Knoten nur so weit verschoben, wie es fuer Nicht-Ueberlappung noetig ist.
+			#UC1: Shift nodes only enough to avoid overlap within the same column.
 			y = preferred_top
 			if placed_y:
 				min_y = placed_y[-1] + ROW_HEIGHT
@@ -355,6 +316,7 @@ def build_network_payload(project_id: int) -> dict[str, Any]:
 			nodes.append(node)
 			node_map[task_id] = node
 
+	#UC1: Add start and end nodes to frame the network visually.
 	start_y = TOP_OFFSET
 	if roots:
 		root_centers = [node_map[root_id]["y"] + NODE_HEIGHT / 2 for root_id in roots if root_id in node_map]
@@ -474,12 +436,13 @@ def build_network_payload(project_id: int) -> dict[str, Any]:
 		"edges": edges,
 	}
 
-
+#REST endpoints
+#Backend availability test
 @app.get("/")
 def root() -> dict[str, str]:
 	return {"status": "ok", "message": "Backend laeuft"}
 
-
+#UC1: Return project metadata
 @app.get("/project/3")
 def get_project_3() -> dict[str, Any]:
 	project = openproject_get(f"projects/{TARGET_PROJECT_ID}")
@@ -492,7 +455,7 @@ def get_project_3() -> dict[str, Any]:
 		"status": rich_text_to_string(project.get("statusExplanation")),
 	}
 
-
+#UC2, UC3: Return work packages for interactive resource allocation and schedule analysis
 @app.get("/project/3/work-packages")
 def get_project_3_work_packages() -> list[dict[str, Any]]:
 	items = fetch_project_work_packages(TARGET_PROJECT_ID)
@@ -522,7 +485,7 @@ def get_project_3_work_packages() -> list[dict[str, Any]]:
 
 	return sorted(result, key=lambda wp: wp.get("id") or 0)
 
-
+#UC2, UC4: Return project members for task assignment and utilization views
 @app.get("/project/3/members")
 def get_project_3_members() -> list[dict[str, Any]]:
 	memberships = fetch_project_memberships(TARGET_PROJECT_ID)
@@ -550,7 +513,7 @@ def get_project_3_members() -> list[dict[str, Any]]:
 
 	return sorted(unique_members.values(), key=lambda member: member["name"].lower())
 
-
+#UC1, UC3, UC4: Return network structure, scheduling data, and resource utilization for visualization
 @app.get("/project/3/network")
 def get_project_3_network() -> dict[str, Any]:
 	return build_network_payload(TARGET_PROJECT_ID)
